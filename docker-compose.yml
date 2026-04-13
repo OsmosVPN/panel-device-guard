@@ -1,0 +1,7 @@
+services:
+  device-guard:
+    build: .
+    container_name: device-guard
+    restart: unless-stopped
+    env_file:
+      - .env

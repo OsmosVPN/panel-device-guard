@@ -1,0 +1,125 @@
+{% extends "base.html" %} {% block title %}Device Guard - Active Users{%
+endblock %} {% block content %}
+<div class="mb-4 text-sm text-gray-400">Auto-refresh every 30 seconds</div>
+
+<div id="activeTable" class="hidden">
+  <div
+    id="activeBody"
+    class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 sm:gap-4"
+  ></div>
+</div>
+<div id="activeEmpty" class="text-center py-12 text-gray-400 hidden">
+  <div class="text-lg mb-2">No active users</div>
+</div>
+
+<script>
+  function esc(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts);
+    if (isNaN(d)) return ts;
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function renderIpCards(ips) {
+    if (!ips || !ips.length)
+      return '<div class="text-gray-500 text-xs">—</div>';
+    return (
+      '<div class="flex flex-wrap gap-2 mt-1">' +
+      ips
+        .map((r) => {
+          let h = `<div class="bg-slate-800 p-2 rounded text-xs flex-1 min-w-[140px]">`;
+          h += `<div class="font-mono font-medium text-gray-100">${esc(r.ip)}</div>`;
+          if (r.node_name)
+            h += `<div class="text-gray-400">${esc(r.node_name)}</div>`;
+          h += `<div class="text-gray-400">${esc(fmtTime(r.last_seen))}</div>`;
+          h += `</div>`;
+          return h;
+        })
+        .join("") +
+      "</div>"
+    );
+  }
+
+  function vcls(n) {
+    if (n >= 3) return "bg-red-900 text-red-200";
+    if (n > 0) return "bg-yellow-900 text-yellow-200";
+    return "bg-green-900 text-green-200";
+  }
+
+  function renderRow(u) {
+    let nameParts = `<span class="font-semibold break-all">${esc(u.username)}</span>`;
+    if (u.whitelisted)
+      nameParts +=
+        ' <span class="inline-block px-1.5 py-0.5 bg-green-900 text-green-200 text-xs rounded">whitelist</span>';
+    if (u.guarded)
+      nameParts +=
+        ' <span class="inline-block px-1.5 py-0.5 bg-red-900 text-red-200 text-xs rounded">🔒 guarded</span>';
+    const btn = u.guarded
+      ? `<button onclick="unbanUser('${esc(u.username)}')" class="shrink-0 px-3 py-1.5 bg-teal-600 hover:bg-teal-700 rounded text-sm font-medium transition">Unban</button>`
+      : `<button onclick="banUser('${esc(u.username)}')" class="shrink-0 px-3 py-1.5 bg-red-600 hover:bg-red-700 rounded text-sm font-medium transition">Ban</button>`;
+    return `<div class="bg-slate-900 rounded-lg border border-slate-800 p-4 flex flex-col gap-3">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex flex-wrap items-center gap-1.5 min-w-0">${nameParts}</div>
+        ${btn}
+      </div>
+      <div class="flex flex-wrap gap-2 text-xs">
+        <span class="bg-slate-800 px-2 py-1 rounded text-gray-300">Status: ${esc(u.status) || "—"}</span>
+        <span class="bg-slate-800 px-2 py-1 rounded text-gray-300">Limit / Active: ${esc(u.device_limit) || "—"} / ${esc(u.active_ip_count)}</span>
+        <span class="px-2 py-1 rounded ${vcls(u.violation_count)}">Violations: ${esc(u.violation_count)}</span>
+      </div>
+      ${renderIpCards(u.active_ips)}
+    </div>`;
+  }
+
+  async function refresh() {
+    const res = await fetch("/api/users");
+    if (!res.ok) return;
+    const data = await res.json();
+    const users = data.active || [];
+    document.getElementById("activeBody").innerHTML = users
+      .map(renderRow)
+      .join("");
+    document
+      .getElementById("activeTable")
+      .classList.toggle("hidden", users.length === 0);
+    document
+      .getElementById("activeEmpty")
+      .classList.toggle("hidden", users.length !== 0);
+  }
+
+  async function banUser(username) {
+    const ttlRaw = prompt("TTL in seconds (empty = config default):", "");
+    if (ttlRaw === null) return;
+    const ttl = ttlRaw.trim() ? Number(ttlRaw.trim()) : null;
+    const res = await fetch("/api/ban", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, ttl_seconds: ttl }),
+    });
+    if (!res.ok) alert("Error banning user");
+    await refresh();
+  }
+
+  async function unbanUser(username) {
+    const res = await fetch("/api/unban", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username }),
+    });
+    if (!res.ok) alert("Error unbanning user");
+    await refresh();
+  }
+
+  refresh();
+  setInterval(refresh, 30000);
+</script>
+{% endblock %}
