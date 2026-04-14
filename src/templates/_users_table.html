@@ -1,0 +1,44 @@
+{# Partial: active users only #}
+{% if active_users %}
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Пользователь</th>
+          <th class="text-center">Лимит / Активных</th>
+          <th class="text-center">Предупреждения</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in active_users %}
+        <tr>
+          <td class="fw-medium">{{ u.username }}</td>
+          <td class="text-center">
+            <span class="badge bg-light text-dark border">{{ u.device_limit if u.device_limit else '—' }}</span>
+            / {% if u.device_limit and u.ip_count > u.device_limit %}
+            <span class="badge bg-danger">{{ u.ip_count }}</span>
+            {% else %}
+            <span class="badge bg-secondary">{{ u.ip_count }}</span>
+            {% endif %}
+          </td>
+          <td class="text-center">
+            {% if u.violations > 0 %}
+            <span class="badge bg-warning text-dark">{{ u.violations }}</span>
+            {% else %}
+            <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td class="text-end">
+            <a href="/user/{{ u.username }}" class="btn btn-sm btn-outline-secondary">Детали</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<p class="text-muted mt-3">Нет активных пользователей с IP в окне мониторинга.</p>
+{% endif %}

@@ -1,0 +1,60 @@
+{% extends "base.html" %} {% block title %}Логи {{ node_name }} — Device Guard{%
+endblock %} {% block content %}
+<style>
+  .log-pre {
+    height: 72vh;
+    overflow-y: auto;
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+</style>
+<div class="d-flex align-items-center justify-content-between mb-4">
+  <div class="d-flex align-items-center gap-2">
+    <a href="/nodes" class="btn btn-outline-secondary btn-sm">← Все ноды</a>
+    <h4 class="mb-0 fw-bold">{{ node_name }}</h4>
+  </div>
+  <div class="d-flex align-items-center gap-2">
+    <span
+      id="spinner"
+      class="htmx-indicator spinner-border spinner-border-sm text-secondary"
+    ></span>
+    <span class="text-muted small" id="refresh-ts">Данные актуальны</span>
+    <button
+      class="btn btn-outline-secondary btn-sm"
+      hx-get="/logs/{{ node_id }}/partial"
+      hx-target="#log-container"
+      hx-swap="innerHTML"
+      hx-indicator="#spinner"
+      onclick="
+        document.getElementById('refresh-ts').textContent =
+          'Обновлено: ' + new Date().toLocaleTimeString()
+      "
+    >
+      Обновить
+    </button>
+  </div>
+</div>
+
+<div
+  id="log-container"
+  hx-get="/logs/{{ node_id }}/partial"
+  hx-trigger="every 60s"
+  hx-target="#log-container"
+  hx-swap="innerHTML"
+  hx-on::after-request="document.getElementById('refresh-ts').textContent = 'Обновлено: ' + new Date().toLocaleTimeString(); scrollToBottom()"
+>
+  {% include "_log_node_partial.html" %}
+</div>
+{% endblock %} {% block scripts %}
+<script>
+  function scrollToBottom() {
+    var el = document.getElementById("log-scroll");
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+  scrollToBottom();
+  document.body.addEventListener("htmx:afterSwap", function (e) {
+    if (e.detail.target.id === "log-container") scrollToBottom();
+  });
+</script>
+{% endblock %}

@@ -1,4 +1,4 @@
-# device-guard (API-only)
+# panel-device-guard (API-only)
 
 Отдельный сервис для временной блокировки пользователей (`disabled`) при превышении лимита устройств на основе **реальных подключений** из node logs WebSocket.
 
@@ -28,6 +28,92 @@
 - `src/main.py` — точка входа и инициализация логгера
 - `src/web.py` — HTTP frontend/API для просмотра состояния guard и ручных действий
 
+## node-device-guard (агент на ноде)
+
+Агент, устанавливаемый на каждую VPN-ноду. Получает список IP-адресов от panel-device-guard и мгновенно сбрасывает их активные соединения через `ss -K` (RST-пакет).
+
+**Зачем:** когда panel-device-guard банит пользователя (ставит `status=disabled` в Marzban), уже установленные TCP-соединения продолжают работать. node-device-guard решает это: принудительно рвёт соединения через `ss -K dst <ip>` в момент бана. Работает с Xray/VLESS и любым другим TCP-прокси.
+
+### Как работает
+
+```
+panel-device-guard (бан)
+    └─ POST /kick {"ips": ["1.2.3.4", ...]}
+           └─ node-device-guard
+                  └─ ss -K dst 1.2.3.4   (RST → соединение немедленно рвётся)
+```
+
+### Переменные агента
+
+| Переменная        | По умолчанию | Описание                                                                                 |
+| ----------------- | ------------ | ---------------------------------------------------------------------------------------- |
+| `NODE_KICK_PORT`  | `62010`      | Порт HTTP-сервера                                                                        |
+| `NODE_KICK_TOKEN` | —            | Shared secret (Bearer token). Если не задан — эндпоинт `/kick` открыт без аутентификации |
+
+### Переменные panel-device-guard для включения кика
+
+| Переменная          | Описание                                                  |
+| ------------------- | --------------------------------------------------------- |
+| `NODE_KICK_ENABLED` | `true` / `false` — включить отправку kick-запросов        |
+| `NODE_KICK_PORT`    | Порт агента (должен совпадать с `NODE_KICK_PORT` на ноде) |
+| `NODE_KICK_TOKEN`   | Тот же токен, что задан на ноде                           |
+
+### Деплой через Docker (рекомендуется)
+
+```bash
+cp .env.example .env
+# Заполни NODE_KICK_TOKEN — тот же что в panel-device-guard .env
+docker compose up -d
+```
+
+> `network_mode: host` и `cap_add: NET_ADMIN` обязательны — иначе `ss -K` не увидит соединения хоста.
+
+### Деплой без Docker
+
+```bash
+apt install -y iproute2 python3 python3-pip
+pip3 install aiohttp
+
+NODE_KICK_PORT=62010 NODE_KICK_TOKEN=your-secret python3 agent.py
+```
+
+Для автозапуска через systemd:
+
+```ini
+# /etc/systemd/system/node-device-guard.service
+[Unit]
+Description=node-device-guard
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/node-device-guard/agent.py
+Restart=always
+Environment=NODE_KICK_PORT=62010
+Environment=NODE_KICK_TOKEN=your-secret
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now node-device-guard
+```
+
+### Требования на ноде
+
+- Linux с `iproute2` (`apt install iproute2`, обычно уже предустановлен)
+- Python 3.10+ или Docker
+- Порт `NODE_KICK_PORT` доступен только с сервера panel-device-guard (закрыть файрволом для остальных)
+
+### Безопасность
+
+- Всегда задавай `NODE_KICK_TOKEN` — случайную строку не менее 32 символов
+- Закрой порт файрволом: разрешай только IP-адрес сервера с panel-device-guard
+- IP валидируется через `ipaddress.ip_address()` перед передачей в `ss` — shell-инъекции невозможны
+
+---
+
 ## Важно
 
 - Сервис **не ходит в БД** напрямую.
@@ -55,8 +141,10 @@
 - `WHITELIST_IPS` — CSV-список IP, которые игнорируются при подсчёте
   - Для IPv6 указывайте обычный адрес (без `[]`), например `2001:db8::1`
 - `DRY_RUN` — если `true`, сервис только логирует действия, но не отправляет изменения пользователя
-- `WEB_HOST`, `WEB_PORT` — адрес и порт встроенного frontend
+- `WEB_ENABLED` — `true` чтобы поднять встроенный web-дашборд (по умолчанию `false`)
+- `WEB_PORT` — порт дашборда (по умолчанию `8080`)
 - `WEB_USERNAME`, `WEB_PASSWORD` — логин/пароль для входа во frontend
+- `WEB_SECRET_KEY` — ключ подписи сессий; если не задан — генерируется случайный (сессии сбрасываются при рестарте)
 - `MANUAL_BLOCK_TTL_SECONDS` — TTL (сек) для ручного бана через UI по умолчанию
 - `WEBHOOK_URL` — (опционально) URL для получения POST-уведомлений о бане и разбане
 - `WEBHOOK_SECRET` — (опционально) секрет для подписи payload; если задан, каждый запрос содержит заголовок `X-Signature: sha256=<hmac>`

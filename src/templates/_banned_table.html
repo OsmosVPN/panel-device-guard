@@ -1,0 +1,60 @@
+{# Partial: banned users only #} {% if banned_users %}
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Пользователь</th>
+          <th>Лимит</th>
+          <th>Заблокирован до</th>
+          <th>Тип</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in banned_users %}
+        <tr>
+          <td class="fw-medium">{{ u.username }}</td>
+          <td>{{ u.device_limit if u.device_limit else '—' }}</td>
+          <td>
+            {% if u.until %}
+            <span
+              class="js-local-time {% if u.until_expired %}text-muted{% else %}text-danger fw-medium{% endif %}"
+              data-ts="{{ u.until.timestamp() | int }}"
+            >
+              {{ u.until.strftime('%d.%m.%Y %H:%M UTC') }}
+            </span>
+            {% if u.until_expired %}<small class="text-muted">(истёк)</small>{%
+            endif %} {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if u.trigger == 'manual' %}
+            <span class="badge bg-warning text-dark">Ручной</span>
+            {% else %}
+            <span class="badge bg-info text-dark">Авто</span>
+            {% endif %}
+          </td>
+          <td class="text-end">
+            <a
+              href="/user/{{ u.username }}"
+              class="btn btn-sm btn-outline-secondary me-1"
+              >Детали</a
+            >
+            <form
+              method="post"
+              action="/user/{{ u.username }}/unban"
+              class="d-inline"
+              onsubmit="return confirm('Разблокировать {{ u.username }}?')"
+            >
+              <button class="btn btn-sm btn-outline-success">Разбанить</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<p class="text-muted mt-3">Нет заблокированных пользователей.</p>
+{% endif %}

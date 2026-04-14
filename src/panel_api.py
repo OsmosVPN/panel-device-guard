@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 import requests
@@ -5,6 +6,8 @@ import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
 from .config import Config
+
+logger = logging.getLogger("panel_device_guard")
 
 
 class PanelClient:
@@ -18,17 +21,42 @@ class PanelClient:
     def _api_url(self, path: str) -> str:
         return f"{self.cfg.panel_base_url.rstrip('/')}{path}"
 
+    def _reset_session(self) -> None:
+        """Discard the current requests.Session and open a fresh one."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
+        self.session.verify = False
+        self._token = None
+
     def login(self) -> None:
-        resp = self.session.post(
-            self._api_url("/api/admin/token"),
-            data={
-                "username": self.cfg.username,
-                "password": self.cfg.password,
-            },
-            timeout=15,
-        )
+        try:
+            resp = self.session.post(
+                self._api_url("/api/admin/token"),
+                data={
+                    "username": self.cfg.username,
+                    "password": self.cfg.password,
+                },
+                timeout=15,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
+            logger.warning("SSL/connection error during login — retrying with fresh session")
+            self._reset_session()
+            resp = self.session.post(
+                self._api_url("/api/admin/token"),
+                data={
+                    "username": self.cfg.username,
+                    "password": self.cfg.password,
+                },
+                timeout=15,
+            )
         resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"login: non-JSON response (status={resp.status_code}): {resp.text[:200]}") from exc
         self._token = data["access_token"]
         self.session.headers.update({"Authorization": f"Bearer {self._token}"})
 
@@ -36,7 +64,15 @@ class PanelClient:
         if not self._token:
             self.login()
 
-        resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
+        try:
+            resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
+            # Stale keep-alive connection (e.g. SSLEOFError). Re-open session and retry once.
+            logger.warning("connection error on %s %s — retrying with fresh session", method, path)
+            self._reset_session()
+            self.login()
+            resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
+
         if resp.status_code == 401:
             self.login()
             resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
@@ -44,7 +80,19 @@ class PanelClient:
         return resp
 
     def list_nodes(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/api/nodes").json()
+        resp = self._request("GET", "/api/nodes")
+        if not resp.content:
+            logger.warning("list_nodes: empty response body (status=%s)", resp.status_code)
+            return []
+        try:
+            result = resp.json()
+        except Exception:
+            logger.error("list_nodes: non-JSON response (status=%s): %r", resp.status_code, resp.text[:300])
+            return []
+        if not isinstance(result, list):
+            logger.warning("list_nodes: unexpected response type=%s: %r", type(result).__name__, str(result)[:200])
+            return []
+        return result
 
     def list_users_page(self, offset: int, limit: int = 200) -> list[dict[str, Any]]:
         resp = self._request("GET", "/api/users", params={"offset": offset, "limit": limit})

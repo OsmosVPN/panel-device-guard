@@ -1,0 +1,108 @@
+{# Partial for /user/{username}/partial — polled by HTMX every 15 s #}
+<div class="card shadow-sm p-4 mb-4">
+  <div class="d-flex align-items-start justify-content-between flex-wrap gap-3">
+    <div>
+      <div class="d-flex gap-2 flex-wrap">
+        {% if user.is_banned %}
+        <span class="badge bg-danger fs-6">Заблокирован</span>
+        {% else %}
+        <span class="badge bg-success fs-6">Активен</span>
+        {% endif %} {% if user.trigger == 'manual' %}
+        <span class="badge bg-warning text-dark fs-6">Ручная блокировка</span>
+        {% elif user.is_banned %}
+        <span class="badge bg-info text-dark fs-6">Авто-блокировка</span>
+        {% endif %}
+      </div>
+      <h5 class="fw-bold mb-1">{{ user.username }}</h5>
+    </div>
+
+    <div class="text-end">
+      {% if user.is_banned %}
+      <form
+        method="post"
+        action="/user/{{ user.username }}/unban"
+        onsubmit="return confirm('Разблокировать {{ user.username }}?')"
+      >
+        <button class="btn btn-success">Разблокировать</button>
+      </form>
+      {% else %}
+      <form
+        method="post"
+        action="/user/{{ user.username }}/ban"
+        onsubmit="return confirm('Заблокировать {{ user.username }}?')"
+      >
+        <button class="btn btn-danger">Заблокировать</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  <hr class="my-3" />
+
+  <div class="row g-3">
+    <div class="col-sm-4">
+      <div class="text-muted small">Лимит устройств</div>
+      <div class="fw-medium">
+        {{ user.device_limit if user.device_limit else '—' }}
+      </div>
+    </div>
+    {% if user.is_banned and user.until %}
+    <div class="col-sm-4">
+      <div class="text-muted small">Заблокирован до</div>
+      <div
+        class="fw-medium {% if user.until_expired %}text-muted{% else %}text-danger{% endif %}"
+      >
+        <span
+          class="js-local-time"
+          data-ts="{{ user.until.timestamp() | int }}"
+        >
+          {{ user.until.strftime('%d.%m.%Y %H:%M UTC') }}
+        </span>
+        {% if user.until_expired %}<small>(срок истёк)</small>{% endif %}
+      </div>
+    </div>
+    {% endif %}
+    <div class="col-sm-4">
+      <div class="text-muted small">Активных IP сейчас</div>
+      <div class="fw-medium">{{ user.ips | length }}</div>
+    </div>
+    <div class="col-sm-4">
+      <div class="text-muted small">Предупреждения</div>
+      <div class="fw-medium">
+        {% if user.violations > 0 %}
+        <span class="badge bg-warning text-dark">{{ user.violations }}</span>
+        {% else %} — {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card shadow-sm p-4">
+  <h6 class="fw-semibold mb-3">Активные IP-адреса</h6>
+  {% if user.ips %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>#</th>
+          <th>IP-адрес</th>
+          <th>Нода</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in user.ip_entries %}
+        <tr>
+          <td class="text-muted">{{ loop.index }}</td>
+          <td><code>{{ entry.ip }}</code></td>
+          <td class="text-muted small">
+            {{ entry.node_name if entry.node_name else '—' }}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">Нет активных IP в текущем окне мониторинга.</p>
+  {% endif %}
+</div>

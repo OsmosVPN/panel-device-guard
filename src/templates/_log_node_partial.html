@@ -1,0 +1,10 @@
+{% if not lines %}
+<div class="text-muted text-center py-5">Логов пока нет.</div>
+{% else %}
+<pre
+  class="log-pre bg-dark text-light rounded p-3 font-monospace mb-0"
+  id="log-scroll"
+>
+{{ lines | select | join('\n') }}</pre
+>
+{% endif %}

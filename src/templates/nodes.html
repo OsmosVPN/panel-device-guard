@@ -1,0 +1,36 @@
+{% extends "base.html" %} {% block title %}Ноды — Device Guard{% endblock %} {%
+block content %}
+<div class="d-flex align-items-center justify-content-between mb-4">
+  <h4 class="mb-0 fw-bold">
+    Ноды <span class="badge bg-success ms-2">{{ nodes | length }}</span>
+  </h4>
+</div>
+
+{% if not nodes %}
+<p class="text-muted">Нет подключённых нод.</p>
+{% else %}
+<div class="row g-3">
+  {% for node_id, node_name in nodes.items() %}
+  <div class="col-sm-6 col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-body d-flex flex-column gap-2">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="fw-semibold fs-5">{{ node_name }}</span>
+          <span class="badge bg-success">Online</span>
+        </div>
+        {% if addresses.get(node_id) %}
+        <div class="text-muted small font-monospace">
+          {{ addresses[node_id] }}
+        </div>
+        {% endif %}
+        <div class="mt-auto pt-2">
+          <a href="/logs/{{ node_id }}" class="btn btn-outline-secondary btn-sm"
+            >Логи</a
+          >
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %} {% endblock %}

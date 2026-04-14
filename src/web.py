@@ -1,164 +1,406 @@
-import asyncio
-import secrets
-from pathlib import Path
+"""Web interface for device-guard."""
 
-from aiohttp import web
-from jinja2 import Environment, FileSystemLoader
+from __future__ import annotations
+
+import asyncio
+import hmac
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
+
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
 
 from .config import Config
-from .guard import DeviceGuard
-from .web_routes import register_routes
+from .note_marker import extract_guard_meta, remove_guard_marker
+from .node_kick import collect_ips_by_node, kick_ips
+from .panel_api import PanelClient
+from .webhook import fire_webhook
+
+if TYPE_CHECKING:
+    from .guard import DeviceGuard
+
+logger = logging.getLogger("panel_device_guard.web")
 
 
-class WebUI:
-    def __init__(self, cfg: Config, guard: DeviceGuard):
-        self.cfg = cfg
-        self.guard = guard
-        self.sessions: set[str] = set()
-        templates_dir = Path(__file__).parent.parent / "templates"
-        self.jinja = Environment(loader=FileSystemLoader(str(templates_dir)), autoescape=True)
+def create_app(cfg: Config, guard: "DeviceGuard") -> FastAPI:
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=cfg.web_secret_key,
+        session_cookie="dguard_session",
+        same_site="strict",
+        https_only=False,
+    )
 
-    def is_authenticated(self, request: web.Request) -> bool:
-        sid = request.cookies.get("dg_session")
-        return bool(sid and sid in self.sessions)
+    import os
+    tmpl = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
-    @web.middleware
-    async def auth_middleware(self, request: web.Request, handler):
-        if request.path in {"/login", "/healthz"}:
-            return await handler(request)
-        if not self.is_authenticated(request):
-            raise web.HTTPFound("/login")
-        return await handler(request)
+    # Separate API client so its requests.Session doesn't race with the guard's client.
+    web_api = PanelClient(cfg)
 
-    async def healthz(self, request: web.Request) -> web.Response:
-        return web.json_response({"ok": True})
+    # ------------------------------------------------------------------ #
+    # Auth helpers                                                         #
+    # ------------------------------------------------------------------ #
 
-    async def login_page(self, request: web.Request) -> web.Response:
-        error = request.query.get("error", "")
-        html = self.jinja.get_template("login.html").render(error=error)
-        return web.Response(text=html, content_type="text/html")
+    def _authed(request: Request) -> bool:
+        return bool(request.session.get("authenticated"))
 
-    async def login_submit(self, request: web.Request) -> web.Response:
-        form = await request.post()
-        username = str(form.get("username", "")).strip()
-        password = str(form.get("password", "")).strip()
+    def _redirect_login() -> RedirectResponse:
+        return RedirectResponse("/login", status_code=302)
 
-        if username != self.cfg.web_username or password != self.cfg.web_password:
-            raise web.HTTPFound("/login?error=Invalid+username+or+password")
+    # ------------------------------------------------------------------ #
+    # Routes                                                               #
+    # ------------------------------------------------------------------ #
 
-        sid = secrets.token_urlsafe(24)
-        self.sessions.add(sid)
-        resp = web.HTTPFound("/")
-        resp.set_cookie("dg_session", sid, httponly=True, samesite="Lax")
-        return resp
+    @app.get("/", include_in_schema=False)
+    async def root(request: Request):
+        return RedirectResponse("/active" if _authed(request) else "/login", status_code=302)
 
-    async def logout(self, request: web.Request) -> web.Response:
-        sid = request.cookies.get("dg_session")
-        if sid:
-            self.sessions.discard(sid)
-        resp = web.HTTPFound("/login")
-        resp.del_cookie("dg_session")
-        return resp
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_get(request: Request):
+        if _authed(request):
+            return RedirectResponse("/active", status_code=302)
+        return tmpl.TemplateResponse("login.html", {"request": request, "error": None})
 
-    async def index(self, request: web.Request) -> web.Response:
-        tab = request.query.get("tab", "active")
-        snapshot = await self.guard.snapshot_users()
-        active = snapshot.get("active", [])
-        banned = snapshot.get("banned", [])
+    @app.post("/login", response_class=HTMLResponse)
+    async def login_post(
+        request: Request,
+        username: str = Form(...),
+        password: str = Form(...),
+    ):
+        if _verify_credentials(username, password, cfg):
+            request.session["authenticated"] = True
+            return RedirectResponse("/active", status_code=303)
+        return tmpl.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Неверный логин или пароль"},
+            status_code=401,
+        )
 
-        if tab == "banned":
-            html = self.jinja.get_template("banned.html").render(
-                tab=tab, users=banned, dry_run=self.cfg.dry_run
-            )
-        elif tab == "info":
-            config_items = [
-                ("PANEL_BASE_URL", self.cfg.panel_base_url),
-                ("EXTRA_DEVICES", self.cfg.extra_devices),
-                ("ACTIVE_WINDOW_SECONDS", self.cfg.active_window_seconds),
-                ("VIOLATION_THRESHOLD", self.cfg.violation_threshold),
-                ("BLOCK_TTL_SECONDS", self.cfg.block_ttl_seconds),
-                ("CHECK_INTERVAL_SECONDS", self.cfg.check_interval_seconds),
-                ("DRY_RUN", self.cfg.dry_run),
-                ("WEB_HOST", self.cfg.web_host),
-                ("WEB_PORT", self.cfg.web_port),
-            ]
-            stats = {
-                "active_users": len(active),
-                "banned_users": len(banned),
-                "whitelisted_users": sum(1 for u in active if u.get("whitelisted")),
-            }
-            html = self.jinja.get_template("info.html").render(
-                tab=tab,
-                config_items=config_items,
-                sensitive_keys={},
-                stats=stats,
-                dry_run=self.cfg.dry_run,
-            )
-        elif tab == "logs":
-            logs_by_node = self.guard.snapshot_logs()
-            html = self.jinja.get_template("logs.html").render(
-                tab=tab, logs_by_node=logs_by_node,
-                dry_run=self.cfg.dry_run,
-                max_lines=self.guard._node_logs_maxlen,
-            )
-        else:
-            tab = "active"
-            html = self.jinja.get_template("active.html").render(
-                tab=tab, users=active, dry_run=self.cfg.dry_run
-            )
+    @app.get("/logout")
+    async def logout(request: Request):
+        request.session.clear()
+        return RedirectResponse("/login", status_code=302)
 
-        return web.Response(text=html, content_type="text/html")
-
-    async def api_logs(self, request: web.Request) -> web.Response:
-        logs_by_node = self.guard.snapshot_logs()
-        return web.json_response({str(k): v for k, v in logs_by_node.items()})
-
-    async def api_users(self, request: web.Request) -> web.Response:
-        snapshot = await self.guard.snapshot_users()
-        return web.json_response({
-            "active": snapshot.get("active", []),
-            "banned": snapshot.get("banned", []),
-            "dry_run": self.cfg.dry_run,
-            "node_names": {str(k): v for k, v in self.guard.node_names.items()},
+    @app.get("/active", response_class=HTMLResponse)
+    async def dashboard(request: Request):
+        if not _authed(request):
+            return _redirect_login()
+        try:
+            active, banned = await _fetch_user_data(guard, web_api)
+        except Exception as exc:
+            logger.error("dashboard fetch error: %s", exc)
+            return tmpl.TemplateResponse("active.html", {
+                "request": request,
+                "active_users": [],
+                "banned_users": [],
+                "fetch_error": str(exc),
+            })
+        return tmpl.TemplateResponse("active.html", {
+            "request": request,
+            "active_users": active,
+            "banned_users": banned,
         })
 
-    async def api_ban(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        username = str(data.get("username", "")).strip()
-        ttl_raw = data.get("ttl_seconds")
-        ttl_seconds = None
-        if ttl_raw not in (None, ""):
-            try:
-                ttl_seconds = int(ttl_raw)
-            except Exception:
-                return web.json_response({"error": "ttl_seconds must be integer"}, status=400)
+    @app.get("/nodes", response_class=HTMLResponse)
+    async def nodes_page(request: Request):
+        if not _authed(request):
+            return _redirect_login()
+        nodes = dict(guard.node_names)
+        addresses = dict(guard.node_addresses)
+        return tmpl.TemplateResponse("nodes.html", {
+            "request": request,
+            "nodes": nodes,
+            "addresses": addresses,
+        })
 
-        if not username:
-            return web.json_response({"error": "username is required"}, status=400)
+    # HTMX partial: replaces only the tables on auto-refresh
+    @app.get("/users-partial", response_class=HTMLResponse)
+    async def users_partial(request: Request):
+        if not _authed(request):
+            return HTMLResponse("", status_code=401)
         try:
-            await self.guard.manual_ban(username, ttl_seconds=ttl_seconds)
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-        return web.json_response({"ok": True})
+            active, banned = await _fetch_user_data(guard, web_api)
+        except Exception as exc:
+            logger.error("users-partial fetch error: %s", exc)
+            return HTMLResponse(
+                f'<div class="alert alert-warning m-3">Ошибка связи с панелью: {exc}</div>',
+                status_code=200,
+            )
+        return tmpl.TemplateResponse("_users_table.html", {
+            "request": request,
+            "active_users": active,
+        })
 
-    async def api_unban(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        username = str(data.get("username", "")).strip()
-        if not username:
-            return web.json_response({"error": "username is required"}, status=400)
-        await self.guard.manual_unban(username)
-        return web.json_response({"ok": True})
+    @app.get("/banned", response_class=HTMLResponse)
+    async def banned_page(request: Request):
+        if not _authed(request):
+            return _redirect_login()
+        try:
+            active, banned = await _fetch_user_data(guard, web_api)
+        except Exception as exc:
+            logger.error("banned fetch error: %s", exc)
+            return tmpl.TemplateResponse("banned.html", {
+                "request": request,
+                "banned_users": [],
+                "fetch_error": str(exc),
+            })
+        return tmpl.TemplateResponse("banned.html", {
+            "request": request,
+            "banned_users": banned,
+        })
 
-    def build_app(self) -> web.Application:
-        app = web.Application(middlewares=[self.auth_middleware])
-        register_routes(app, self)
-        return app
+    @app.get("/banned-partial", response_class=HTMLResponse)
+    async def banned_partial(request: Request):
+        if not _authed(request):
+            return HTMLResponse("", status_code=401)
+        try:
+            active, banned = await _fetch_user_data(guard, web_api)
+        except Exception as exc:
+            logger.error("banned-partial fetch error: %s", exc)
+            return HTMLResponse(
+                f'<div class="alert alert-warning m-3">Ошибка связи с панелью: {exc}</div>',
+                status_code=200,
+            )
+        return tmpl.TemplateResponse("_banned_table.html", {
+            "request": request,
+            "banned_users": banned,
+        })
 
-    async def run(self) -> None:
-        app = self.build_app()
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host=self.cfg.web_host, port=self.cfg.web_port)
-        await site.start()
-        while True:
-            await asyncio.sleep(3600)
+    @app.get("/user/{username}", response_class=HTMLResponse)
+    async def user_detail(request: Request, username: str):
+        if not _authed(request):
+            return _redirect_login()
+        try:
+            info = await _fetch_one_user(guard, web_api, username)
+        except Exception as exc:
+            logger.error("user_detail fetch error user=%s: %s", username, exc)
+            return HTMLResponse(
+                f'<div class="alert alert-warning m-3">Ошибка связи с панелью: {exc}</div>',
+                status_code=200,
+            )
+        return tmpl.TemplateResponse("user_detail.html", {
+            "request": request,
+            "user": info,
+        })
+
+    @app.get("/user/{username}/partial", response_class=HTMLResponse)
+    async def user_detail_partial(request: Request, username: str):
+        if not _authed(request):
+            return HTMLResponse("", status_code=401)
+        try:
+            info = await _fetch_one_user(guard, web_api, username)
+        except Exception as exc:
+            logger.error("user_detail_partial fetch error user=%s: %s", username, exc)
+            return HTMLResponse(
+                f'<div class="alert alert-warning m-3">Ошибка связи с панелью: {exc}</div>',
+                status_code=200,
+            )
+        return tmpl.TemplateResponse("_user_detail_partial.html", {
+            "request": request,
+            "user": info,
+        })
+
+    @app.post("/user/{username}/ban")
+    async def ban_user(request: Request, username: str):
+        if not _authed(request):
+            return _redirect_login()
+        await _do_ban(cfg, guard, web_api, username)
+        return RedirectResponse(f"/user/{username}", status_code=303)
+
+    @app.post("/user/{username}/unban")
+    async def unban_user(request: Request, username: str):
+        if not _authed(request):
+            return _redirect_login()
+        await _do_unban(cfg, guard, web_api, username)
+        return RedirectResponse(f"/user/{username}", status_code=303)
+
+    @app.get("/logs/{node_id}", response_class=HTMLResponse)
+    async def log_node_page(request: Request, node_id: int):
+        if not _authed(request):
+            return _redirect_login()
+        lines = list(guard.node_logs.get(node_id, []))
+        node_name = guard.node_names.get(node_id, f"Node #{node_id}")
+        return tmpl.TemplateResponse("log_node.html", {
+            "request": request,
+            "node_id": node_id,
+            "node_name": node_name,
+            "lines": lines,
+        })
+
+    @app.get("/logs/{node_id}/partial", response_class=HTMLResponse)
+    async def log_node_partial(request: Request, node_id: int):
+        if not _authed(request):
+            return HTMLResponse("", status_code=401)
+        lines = list(guard.node_logs.get(node_id, []))
+        node_name = guard.node_names.get(node_id, f"Node #{node_id}")
+        return tmpl.TemplateResponse("_log_node_partial.html", {
+            "request": request,
+            "node_id": node_id,
+            "node_name": node_name,
+            "lines": lines,
+        })
+
+    return app
+
+
+# ------------------------------------------------------------------ #
+# Auth                                                                #
+# ------------------------------------------------------------------ #
+
+def _verify_credentials(username: str, password: str, cfg: Config) -> bool:
+    # Constant-time comparison to avoid timing attacks.
+    ok_user = hmac.compare_digest(username.encode(), cfg.web_username.encode())
+    ok_pass = hmac.compare_digest(password.encode(), cfg.web_password.encode())
+    return ok_user and ok_pass
+
+
+# ------------------------------------------------------------------ #
+# Data fetching                                                        #
+# ------------------------------------------------------------------ #
+
+async def _fetch_user_data(guard: "DeviceGuard", api: PanelClient):
+    """Return (active_users, banned_users) lists.
+
+    Active users = status active AND have at least one IP in the active window.
+    Banned users  = status disabled AND have a guard marker in their note.
+    """
+    users = await asyncio.to_thread(api.list_all_users)
+    now_ts = time.time()
+    now_dt = datetime.now(timezone.utc)
+
+    # Snapshot in-memory IP state and violation counts under the lock.
+    ip_snapshot: dict[str, list[str]] = {}
+    violation_snapshot: dict[str, int] = {}
+    async with guard._state_lock:
+        for uname in list(guard.last_seen):
+            guard._prune_ips(uname, now_ts)
+        for uname, recs in guard.last_seen.items():
+            ip_snapshot[uname] = list(recs.keys())
+        violation_snapshot = dict(guard.violation_count)
+
+    active: list[dict] = []
+    banned: list[dict] = []
+
+    for user in users:
+        uname = user.get("username")
+        if not uname:
+            continue
+        status = user.get("status", "")
+        note = user.get("note")
+        meta = extract_guard_meta(note, guard.cfg.note_marker_prefix)
+
+        if meta and status == "disabled":
+            try:
+                until_dt = datetime.fromisoformat(meta["until"])
+            except (KeyError, ValueError):
+                until_dt = None
+            banned.append({
+                "username": uname,
+                "until": until_dt,
+                "until_expired": until_dt is not None and until_dt <= now_dt,
+                "device_limit": user.get("device_limit"),
+                "trigger": meta.get("trigger", "auto"),
+            })
+        elif status == "active":
+            ips = ip_snapshot.get(uname, [])
+            if ips:
+                active.append({
+                    "username": uname,
+                    "device_limit": user.get("device_limit"),
+                    "ip_count": len(ips),
+                    "violations": violation_snapshot.get(uname, 0),
+                })
+
+    active.sort(key=lambda u: -u["ip_count"])
+    return active, banned
+
+
+async def _fetch_one_user(guard: "DeviceGuard", api: PanelClient, username: str) -> dict:
+    user = await asyncio.to_thread(api.get_user, username)
+    now_ts = time.time()
+    now_dt = datetime.now(timezone.utc)
+    status = user.get("status", "")
+    note = user.get("note")
+    meta = extract_guard_meta(note, guard.cfg.note_marker_prefix)
+
+    async with guard._state_lock:
+        guard._prune_ips(username, now_ts)
+        ip_records = dict(guard.last_seen.get(username, {}))
+        violations = guard.violation_count.get(username, 0)
+    node_names = dict(guard.node_names)
+
+    # Build list of (ip, node_name) sorted by ip
+    ip_entries = sorted(
+        [
+            {
+                "ip": ip,
+                "node_name": node_names.get(int(rec["node_id"])) if rec.get("node_id") is not None else None,
+            }
+            for ip, rec in ip_records.items()
+        ],
+        key=lambda e: e["ip"],
+    )
+
+    until_dt: datetime | None = None
+    if meta and "until" in meta:
+        try:
+            until_dt = datetime.fromisoformat(meta["until"])
+        except ValueError:
+            pass
+
+    return {
+        "username": username,
+        "status": status,
+        "device_limit": user.get("device_limit"),
+        "ips": [e["ip"] for e in ip_entries],
+        "ip_entries": ip_entries,
+        "is_banned": bool(meta and status == "disabled"),
+        "until": until_dt,
+        "until_expired": until_dt is not None and until_dt <= now_dt,
+        "trigger": meta.get("trigger", "auto") if meta else None,
+        "violations": violations,
+    }
+
+
+# ------------------------------------------------------------------ #
+# Mutations (ban / unban)                                             #
+# ------------------------------------------------------------------ #
+
+async def _do_ban(cfg: Config, guard: "DeviceGuard", api: PanelClient, username: str) -> None:
+    user = await asyncio.to_thread(api.get_user, username)
+    prev_status = user.get("status", "active")
+    note = user.get("note")
+    now_dt = datetime.now(timezone.utc)
+    until_iso = (now_dt + timedelta(seconds=cfg.manual_block_ttl_seconds)).isoformat()
+    clean_note = remove_guard_marker(note, cfg.note_marker_prefix)
+    marker = f"{cfg.note_marker_prefix} until={until_iso} prev={prev_status} trigger=manual"
+    new_note = (f"{clean_note}\n{marker}" if clean_note else marker)[:500]
+    payload = {"status": "disabled", "note": new_note}
+    ips_by_node = collect_ips_by_node(guard.last_seen, username)
+    async with guard._state_lock:
+        await asyncio.to_thread(api.modify_user, username, payload)
+        guard._clear_user_state(username)
+    logger.info("web manual ban user=%s until=%s", username, until_iso)
+    guard.fire_ban_side_effects(username, ips_by_node, trigger="manual")
+
+
+async def _do_unban(cfg: Config, guard: "DeviceGuard", api: PanelClient, username: str) -> None:
+    user = await asyncio.to_thread(api.get_user, username)
+    note = user.get("note")
+    meta = extract_guard_meta(note, cfg.note_marker_prefix)
+    prev = (meta.get("prev", "active") if meta else "active")
+    restore_status = prev if prev in {"active", "disabled"} else "active"
+    payload = {
+        "status": restore_status,
+        "note": remove_guard_marker(note, cfg.note_marker_prefix),
+    }
+    async with guard._state_lock:
+        await asyncio.to_thread(api.modify_user, username, payload)
+        guard._clear_user_state(username)
+    logger.info("web manual unban user=%s -> status=%s", username, restore_status)
+    guard.fire_unban_side_effects(username, trigger="manual")

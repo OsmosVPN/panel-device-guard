@@ -18,12 +18,3 @@ def parse_log_line(line: str) -> tuple[str, str] | None:
     except ValueError:
         return None
     return normalized_ip, match.group("email")
-
-
-def parse_log_line_with_node(line: str, node_id: int) -> tuple[str, str, int] | None:
-    """Parse log line and include node_id from context"""
-    result = parse_log_line(line)
-    if not result:
-        return None
-    ip, email = result
-    return ip, email, node_id

@@ -1,0 +1,42 @@
+{% extends "base.html" %} {% block title %}{{ user.username }} — Device Guard{%
+endblock %} {% block content %}
+<div class="d-flex align-items-center justify-content-between mb-4">
+  <a href="/active" class="text-decoration-none text-muted small">← Активные</a>
+  <span
+    id="detail-spinner"
+    class="htmx-indicator spinner-border spinner-border-sm text-secondary"
+  ></span>
+</div>
+
+<div
+  id="detail-container"
+  hx-get="/user/{{ user.username }}/partial"
+  hx-trigger="every 60s"
+  hx-target="#detail-container"
+  hx-swap="innerHTML"
+  hx-indicator="#detail-spinner"
+  hx-on::after-request="applyLocalTimes(document.getElementById('detail-container'));"
+>
+  {% include "_user_detail_partial.html" %}
+</div>
+
+{% endblock %} {% block scripts %}
+<script>
+  function applyLocalTimes(root) {
+    (root || document)
+      .querySelectorAll(".js-local-time[data-ts]")
+      .forEach(function (el) {
+        var ts = parseInt(el.dataset.ts, 10);
+        el.textContent = new Intl.DateTimeFormat(undefined, {
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(new Date(ts * 1000));
+        delete el.dataset.ts;
+      });
+  }
+  applyLocalTimes();
+</script>
+{% endblock %}

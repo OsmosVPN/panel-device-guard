@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -23,15 +24,18 @@ class Config:
     whitelist_usernames: set[str]
     whitelist_ips: set[str]
     dry_run: bool
-    web_host: str
-    web_port: int
-    web_username: str
-    web_password: str
     manual_block_ttl_seconds: int
     webhook_url: str | None
     webhook_secret: str | None
+    node_kick_enabled: bool
     node_kick_port: int  # port where node-agent listens on each node (0 = disabled)
     node_kick_token: str | None
+    # Web interface
+    web_enabled: bool
+    web_port: int
+    web_secret_key: str
+    web_username: str
+    web_password: str
 
 
 def _get_int(name: str, default: int) -> int:
@@ -52,6 +56,14 @@ def _get_csv_set(name: str) -> set[str]:
     return {item.strip().lower() for item in raw.split(",") if item.strip()}
 
 
+def _random_secret() -> str:
+    import logging
+    logging.getLogger("panel_device_guard").warning(
+        "WEB_SECRET_KEY not set — generated a random key; sessions won't survive restarts"
+    )
+    return secrets.token_hex(32)
+
+
 def load_config() -> Config:
     panel_base_url = os.getenv("PANEL_BASE_URL", "").strip()
     username = os.getenv("PANEL_USERNAME", "").strip()
@@ -63,11 +75,6 @@ def load_config() -> Config:
         raise RuntimeError("PANEL_USERNAME and PANEL_PASSWORD are required")
 
     regex_text = os.getenv("EMAIL_TO_USERNAME_REGEX", r"(?:\d+\.)?(?P<username>.+)")
-
-    web_username = os.getenv("WEB_USERNAME", "").strip()
-    web_password = os.getenv("WEB_PASSWORD", "").strip()
-    if not web_username or not web_password:
-        raise RuntimeError("WEB_USERNAME and WEB_PASSWORD are required")
 
     return Config(
         panel_base_url=panel_base_url,
@@ -84,13 +91,15 @@ def load_config() -> Config:
         whitelist_usernames=_get_csv_set("WHITELIST_USERNAMES"),
         whitelist_ips=_get_csv_set("WHITELIST_IPS"),
         dry_run=_get_bool("DRY_RUN", False),
-        web_host=os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0",
-        web_port=_get_int("WEB_PORT", 8088),
-        web_username=web_username,
-        web_password=web_password,
         manual_block_ttl_seconds=_get_int("MANUAL_BLOCK_TTL_SECONDS", _get_int("BLOCK_TTL_SECONDS", 1800)),
         webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
         webhook_secret=os.getenv("WEBHOOK_SECRET", "").strip() or None,
-        node_kick_port=_get_int("NODE_KICK_PORT", 0),
+        node_kick_enabled=_get_bool("NODE_KICK_ENABLE", False),
+        node_kick_port=_get_int("NODE_KICK_PORT", 62010),
         node_kick_token=os.getenv("NODE_KICK_TOKEN", "").strip() or None,
+        web_enabled=_get_bool("WEB_ENABLED", False),
+        web_port=_get_int("WEB_PORT", 8080),
+        web_secret_key=os.getenv("WEB_SECRET_KEY", "").strip() or _random_secret(),
+        web_username=os.getenv("WEB_USERNAME", "admin").strip(),
+        web_password=os.getenv("WEB_PASSWORD", "").strip(),
     )

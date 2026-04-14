@@ -1,7 +1,7 @@
 services:
-  device-guard:
+  panel-device-guard:
     build: .
-    container_name: device-guard
+    container_name: panel-device-guard
     restart: unless-stopped
     env_file:
       - .env
