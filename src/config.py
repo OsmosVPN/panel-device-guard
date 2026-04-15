@@ -30,6 +30,8 @@ class Config:
     node_kick_enabled: bool
     node_kick_port: int  # port where node-agent listens on each node (0 = disabled)
     node_kick_token: str | None
+    api_retry_delay_seconds: float
+    api_retry_max_delay_seconds: float
     # Web interface
     web_enabled: bool
     web_port: int
@@ -102,6 +104,8 @@ def load_config() -> Config:
         node_kick_enabled=node_kick_enabled,
         node_kick_port=node_kick_port,
         node_kick_token=os.getenv("NODE_KICK_TOKEN", "").strip() or None,
+        api_retry_delay_seconds=_get_float("API_RETRY_DELAY_SECONDS", 3.0),
+        api_retry_max_delay_seconds=_get_float("API_RETRY_MAX_DELAY_SECONDS", 30.0),
         web_enabled=_get_bool("WEB_ENABLED", False),
         web_port=_get_int("WEB_PORT", 8080),
         web_secret_key=os.getenv("WEB_SECRET_KEY", "").strip() or _random_secret(),

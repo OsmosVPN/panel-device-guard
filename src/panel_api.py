@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any
 
 import requests
@@ -21,6 +22,11 @@ class PanelClient:
     def _api_url(self, path: str) -> str:
         return f"{self.cfg.panel_base_url.rstrip('/')}{path}"
 
+    def _retry_delay(self, attempt: int) -> float:
+        base = max(0.1, float(self.cfg.api_retry_delay_seconds))
+        cap = max(base, float(self.cfg.api_retry_max_delay_seconds))
+        return min(base * (2 ** max(0, attempt - 1)), cap)
+
     def _reset_session(self) -> None:
         """Discard the current requests.Session and open a fresh one."""
         try:
@@ -38,52 +44,102 @@ class PanelClient:
             pass
 
     def login(self) -> None:
-        try:
-            resp = self.session.post(
-                self._api_url("/api/admin/token"),
-                data={
-                    "username": self.cfg.username,
-                    "password": self.cfg.password,
-                },
-                timeout=15,
-            )
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
-            logger.warning("SSL/connection error during login — retrying with fresh session")
-            self._reset_session()
-            resp = self.session.post(
-                self._api_url("/api/admin/token"),
-                data={
-                    "username": self.cfg.username,
-                    "password": self.cfg.password,
-                },
-                timeout=15,
-            )
-        resp.raise_for_status()
-        try:
-            data = resp.json()
-        except Exception as exc:
-            raise RuntimeError(f"login: non-JSON response (status={resp.status_code}): {resp.text[:200]}") from exc
-        self._token = data["access_token"]
-        self.session.headers.update({"Authorization": f"Bearer {self._token}"})
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = self.session.post(
+                    self._api_url("/api/admin/token"),
+                    data={
+                        "username": self.cfg.username,
+                        "password": self.cfg.password,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                try:
+                    data = resp.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"login: non-JSON response (status={resp.status_code}): {resp.text[:200]}"
+                    ) from exc
+                self._token = data["access_token"]
+                self.session.headers.update({"Authorization": f"Bearer {self._token}"})
+                return
+            except (requests.exceptions.ConnectionError, requests.exceptions.SSLError) as exc:
+                delay = self._retry_delay(attempt)
+                logger.warning(
+                    "login network error (attempt=%s): %r; retry in %.1fs",
+                    attempt,
+                    exc,
+                    delay,
+                )
+                self._reset_session()
+                time.sleep(delay)
+                continue
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status in {429, 500, 502, 503, 504}:
+                    delay = self._retry_delay(attempt)
+                    logger.warning(
+                        "login transient HTTP %s (attempt=%s); retry in %.1fs",
+                        status,
+                        attempt,
+                        delay,
+                    )
+                    self._reset_session()
+                    time.sleep(delay)
+                    continue
+                raise
 
     def _request(self, method: str, path: str, **kwargs):
-        if not self._token:
-            self.login()
+        attempt = 0
+        while True:
+            attempt += 1
+            if not self._token:
+                self.login()
 
-        try:
-            resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
-            # Stale keep-alive connection (e.g. SSLEOFError). Re-open session and retry once.
-            logger.warning("connection error on %s %s — retrying with fresh session", method, path)
-            self._reset_session()
-            self.login()
-            resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
+            try:
+                resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.SSLError) as exc:
+                delay = self._retry_delay(attempt)
+                logger.warning(
+                    "connection error on %s %s (attempt=%s): %r; retry in %.1fs",
+                    method,
+                    path,
+                    attempt,
+                    exc,
+                    delay,
+                )
+                self._reset_session()
+                time.sleep(delay)
+                continue
 
-        if resp.status_code == 401:
-            self.login()
-            resp = self.session.request(method, self._api_url(path), timeout=20, **kwargs)
-        resp.raise_for_status()
-        return resp
+            if resp.status_code == 401:
+                logger.warning("unauthorized on %s %s, refreshing token", method, path)
+                self._reset_session()
+                self.login()
+                continue
+
+            try:
+                resp.raise_for_status()
+                return resp
+            except requests.exceptions.HTTPError as exc:
+                status = resp.status_code
+                if status in {429, 500, 502, 503, 504}:
+                    delay = self._retry_delay(attempt)
+                    logger.warning(
+                        "transient HTTP %s on %s %s (attempt=%s); retry in %.1fs",
+                        status,
+                        method,
+                        path,
+                        attempt,
+                        delay,
+                    )
+                    self._reset_session()
+                    time.sleep(delay)
+                    continue
+                raise exc
 
     def list_nodes(self) -> list[dict[str, Any]]:
         resp = self._request("GET", "/api/nodes")
