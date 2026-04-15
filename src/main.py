@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 
 import uvicorn
 
@@ -21,8 +22,10 @@ async def main() -> None:
     cfg = load_config()
     api = PanelClient(cfg)
     guard = DeviceGuard(cfg, api)
+    logger = logging.getLogger("panel_device_guard")
 
     tasks: list[asyncio.Task] = [asyncio.create_task(guard.run())]
+    server: uvicorn.Server | None = None
 
     if cfg.web_enabled:
         if not cfg.web_password:
@@ -37,11 +40,49 @@ async def main() -> None:
         )
         server = uvicorn.Server(uvi_cfg)
         tasks.append(asyncio.create_task(server.serve()))
-        logging.getLogger("panel_device_guard").info(
+        logger.info(
             "web UI listening on http://0.0.0.0:%s", cfg.web_port
         )
 
-    await asyncio.gather(*tasks)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown() -> None:
+        if not stop_event.is_set():
+            logger.info("shutdown signal received, stopping gracefully")
+            stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except NotImplementedError:
+            # Fallback for environments where add_signal_handler is not supported.
+            signal.signal(sig, lambda *_: _request_shutdown())
+
+    stop_waiter = asyncio.create_task(stop_event.wait())
+    try:
+        done, _ = await asyncio.wait([stop_waiter, *tasks], return_when=asyncio.FIRST_COMPLETED)
+        if stop_waiter not in done:
+            # One of worker tasks exited unexpectedly.
+            for completed in done:
+                if completed is stop_waiter:
+                    continue
+                exc = completed.exception()
+                if exc:
+                    logger.error("worker task exited with error: %s", exc)
+                else:
+                    logger.warning("worker task exited unexpectedly")
+            stop_event.set()
+    finally:
+        stop_waiter.cancel()
+        if server is not None:
+            server.should_exit = True
+
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        api.close()
 
 
 if __name__ == "__main__":

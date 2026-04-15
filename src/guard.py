@@ -7,7 +7,7 @@ from typing import Any
 
 from .config import Config
 from .log_parser import parse_log_line
-from .node_kick import IpRecord, collect_ips_by_node, kick_ips
+from .node_kick import IpRecord, kick_ips
 from .node_monitor import monitor_node
 from .note_marker import append_guard_marker, extract_guard_meta, remove_guard_marker
 from .panel_api import PanelClient
@@ -119,6 +119,14 @@ class DeviceGuard:
         self.violation_count.pop(username, None)
         self.last_seen.pop(username, None)
 
+    @staticmethod
+    def _ips_by_node_from_snapshot(user_ips: dict[str, IpRecord]) -> dict[int, list[str]]:
+        result: dict[int, list[str]] = defaultdict(list)
+        for ip, rec in user_ips.items():
+            if (nid := rec.get("node_id")) is not None:
+                result[int(nid)].append(ip)
+        return dict(result)
+
     # ------------------------------------------------------------------ #
     # Evaluation loop                                                      #
     # ------------------------------------------------------------------ #
@@ -180,10 +188,13 @@ class DeviceGuard:
                 }
                 logger.warning("block user=%s active_ips=%s threshold=%s until=%s",
                                username, count, threshold, until_iso)
-                # Snapshot before acquiring lock so we don't hold it longer than needed.
-                ip_list = sorted(self.last_seen.get(username, {}))
-                ips_by_node = collect_ips_by_node(self.last_seen, username)
+                # Snapshot/clear inside the same lock to avoid races and inconsistent state.
+                ip_list: list[str] = []
+                ips_by_node: dict[int, list[str]] = {}
                 async with self._state_lock:
+                    user_ips = dict(self.last_seen.get(username, {}))
+                    ip_list = sorted(user_ips)
+                    ips_by_node = self._ips_by_node_from_snapshot(user_ips)
                     await self._apply_modify(username, payload)
                     self._clear_user_state(username)
                 self.fire_ban_side_effects(
@@ -233,3 +244,6 @@ class DeviceGuard:
         evaluator = asyncio.create_task(self._evaluation_loop())
         monitors = [asyncio.create_task(monitor_node(nid, self.cfg, self.api, self._on_ws_line)) for nid in node_ids]
         await asyncio.gather(*monitors, evaluator) if monitors else await evaluator
+
+
+    __all__ = ["DeviceGuard"]

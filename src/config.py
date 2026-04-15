@@ -76,6 +76,11 @@ def load_config() -> Config:
 
     regex_text = os.getenv("EMAIL_TO_USERNAME_REGEX", r"(?:\d+\.)?(?P<username>.+)")
 
+    node_kick_enabled = _get_bool("NODE_KICK_ENABLE", False)
+    node_kick_port = _get_int("NODE_KICK_PORT", 62010)
+    if node_kick_enabled and not (1 <= node_kick_port <= 65535):
+        raise RuntimeError("NODE_KICK_PORT must be in range 1..65535 when NODE_KICK_ENABLE=true")
+
     return Config(
         panel_base_url=panel_base_url,
         username=username,
@@ -94,8 +99,8 @@ def load_config() -> Config:
         manual_block_ttl_seconds=_get_int("MANUAL_BLOCK_TTL_SECONDS", _get_int("BLOCK_TTL_SECONDS", 1800)),
         webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
         webhook_secret=os.getenv("WEBHOOK_SECRET", "").strip() or None,
-        node_kick_enabled=_get_bool("NODE_KICK_ENABLE", False),
-        node_kick_port=_get_int("NODE_KICK_PORT", 62010),
+        node_kick_enabled=node_kick_enabled,
+        node_kick_port=node_kick_port,
         node_kick_token=os.getenv("NODE_KICK_TOKEN", "").strip() or None,
         web_enabled=_get_bool("WEB_ENABLED", False),
         web_port=_get_int("WEB_PORT", 8080),
@@ -103,3 +108,6 @@ def load_config() -> Config:
         web_username=os.getenv("WEB_USERNAME", "admin").strip(),
         web_password=os.getenv("WEB_PASSWORD", "").strip(),
     )
+
+
+    __all__ = ["Config", "load_config"]

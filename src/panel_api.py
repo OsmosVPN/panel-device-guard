@@ -31,6 +31,12 @@ class PanelClient:
         self.session.verify = False
         self._token = None
 
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
     def login(self) -> None:
         try:
             resp = self.session.post(
@@ -96,8 +102,28 @@ class PanelClient:
 
     def list_users_page(self, offset: int, limit: int = 200) -> list[dict[str, Any]]:
         resp = self._request("GET", "/api/users", params={"offset": offset, "limit": limit})
-        data = resp.json()
-        return data.get("users", [])
+        if not resp.content:
+            logger.warning("list_users_page: empty response body (status=%s offset=%s)", resp.status_code, offset)
+            return []
+        try:
+            data = resp.json()
+        except Exception:
+            logger.error(
+                "list_users_page: non-JSON response (status=%s offset=%s): %r",
+                resp.status_code,
+                offset,
+                resp.text[:300],
+            )
+            return []
+        users = data.get("users", []) if isinstance(data, dict) else []
+        if not isinstance(users, list):
+            logger.warning(
+                "list_users_page: unexpected users type=%s offset=%s",
+                type(users).__name__,
+                offset,
+            )
+            return []
+        return users
 
     def list_all_users(self) -> list[dict[str, Any]]:
         users: list[dict[str, Any]] = []
@@ -118,3 +144,6 @@ class PanelClient:
 
     def get_user(self, username: str) -> dict[str, Any]:
         return self._request("GET", f"/api/user/{username}").json()
+
+
+__all__ = ["PanelClient"]
